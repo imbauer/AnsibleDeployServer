@@ -1,0 +1,6 @@
+group_vars/
+pass.yml
+.idea
+playbook.retry
+ansible.cfg
+create-and-configure.retry

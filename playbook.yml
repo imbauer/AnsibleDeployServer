@@ -1,0 +1,191 @@
+# AWS playbook
+---
+
+- hosts: localhost
+  connection: local
+  gather_facts: False
+  become: yes
+  become_method: sudo
+
+
+  vars:
+    key_name: my_aws
+    region: us-east-2
+    image: ami-0f93b5fd8f220e428 # https://cloud-images.ubuntu.com/locator/ec2/
+    id: "configjen5"
+    sec_group: "{{ id }}-sec"
+    ansible_python_interpreter: /usr/bin/python3
+
+
+  tasks:
+
+    - name: Facts
+      block:
+
+        - name: Get instances facts
+          ec2_instance_facts:
+            aws_access_key: "{{ec2_access_key}}"
+            aws_secret_key: "{{ec2_secret_key}}"
+            region: "{{ region }}"
+          register: result
+
+        - name: Instances ID
+          debug:
+            msg: "ID: {{ item.instance_id }} - State: {{ item.state.name }} - Public DNS: {{ item.public_dns_name }}"
+          loop: "{{ result.instances }}"
+
+      tags: always
+
+
+    - name: Provisioning EC2 instances
+      block:
+
+        - name: Upload public key to AWS
+          ec2_key:
+            name: "{{ key_name }}"
+            key_material: "{{ lookup('file', '/home/vanya/.ssh/my_aws.pub') }}"
+            region: "{{ region }}"
+            aws_access_key: "{{ec2_access_key}}"
+            aws_secret_key: "{{ec2_secret_key}}"
+
+        - name: Create security group
+          ec2_group:
+            name: "{{ sec_group }}"
+            description: "Sec group for app {{ id }}"
+            # vpc_id: 12345
+            region: "{{ region }}"
+            aws_access_key: "{{ec2_access_key}}"
+            aws_secret_key: "{{ec2_secret_key}}"
+            rules:
+              - proto: tcp
+                ports:
+                  - 22
+                cidr_ip: 0.0.0.0/0
+                rule_desc: allow all on ssh port
+              - proto: tcp
+                ports:
+                  - 80
+                cidr_ip: 0.0.0.0/0
+                rule_desc: allow all on ssh port
+              - proto: tcp
+                ports:
+                  - 50000
+                cidr_ip: 0.0.0.0/0
+                rule_desc: allow all on ssh port
+              - proto: tcp
+                ports:
+                  - 8080
+                cidr_ip: 0.0.0.0/0
+                rule_desc: allow all on ssh port
+              - proto: tcp
+                ports:
+                  - 443
+                cidr_ip: 0.0.0.0/0
+                rule_desc: allow all on ssh port
+          register: result_sec_group
+
+        - name: Provision instance(s)
+          ec2:
+            aws_access_key: "{{ec2_access_key}}"
+            aws_secret_key: "{{ec2_secret_key}}"
+            key_name: "{{ key_name }}"
+            id: "{{ id }}"
+            group_id: "{{ result_sec_group.group_id }}"
+            image: "{{ image }}"
+            instance_type: t2.micro
+            region: "{{ region }}"
+            wait: true
+            count: 1
+            # exact_count: 2
+            # count_tag:
+            #   Name: App
+            # instance_tags:
+            #   Name: App
+          register: ec2
+
+        - name: Add new instance to host group
+          add_host:
+            hostname: "{{ item.public_ip }}"
+            groupname: launched
+          with_items: "{{ ec2.instances }}"
+
+        - name: Provision route 53 record
+          route53:
+            aws_access_key: "{{ec2_access_key}}"
+            aws_secret_key: "{{ec2_secret_key}}"
+            state: present
+            zone: jenkins.mmacountdown.com
+            record: jenkins.mmacountdown.com
+            type: A
+            ttl: 300
+            value: "{{ item.public_ip }}"
+            wait: yes
+          with_items: "{{ ec2.instances }}"
+
+
+        - name: Wait for SSH to come up
+          wait_for: host={{ item.public_dns_name }} port=22 delay=150 timeout=360 state=started
+          with_items: "{{ ec2.instances }}"
+
+
+      tags: ['never', 'create_ec2']
+
+- hosts: launched
+  name: configuration play
+  user: ubuntu
+  gather_facts: False
+  become: yes
+  become_method: sudo
+
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+
+  tasks:
+
+    - name: Server setup
+      block:
+
+          - name: Update apt cache
+            shell: apt-get update
+
+          - name: Get Docker certificates
+            shell: apt-get install apt-transport-https ca-certificates curl software-properties-common
+
+          - name: Get Docker key
+            shell: curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+
+          - name: Add Docker repository
+            shell: add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+
+          - name: Update apt cache
+            shell: apt-get update
+
+          - name: Install latest version of Docker
+            shell: apt-get install docker-ce -y
+
+          - name: Install docker-compose
+            shell: curl -L "https://github.com/docker/compose/releases/download/1.25.3/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+
+          - name: Give execute permissions to docker-compose
+            shell: chmod +x /usr/local/bin/docker-compose
+
+          - name: Upload the git repo for my jenkins server
+            shell: git clone https://github.com/imbauer/JenkinsMMACountdown.git
+
+#          - name: cd into Jenkins directory
+#            shell: cd JenkinsMMACountdown/
+
+          - name: Run init script to make ec2 instance secure with ssl certificate from letsencrypt
+            command: sh -c "/home/ubuntu/JenkinsMMACountdown/init-letsencrypt.sh -y"
+            ignore_errors: true
+
+          - name: Restart server
+            shell: docker-compose -f JenkinsMMACountdown/docker-compose.yml down
+
+          - name: Restart server
+            shell: docker-compose -f JenkinsMMACountdown/docker-compose.yml build
+
+          - name: Restart server
+            shell: docker-compose -f JenkinsMMACountdown/docker-compose.yml up -d
+
+      tags: setup
